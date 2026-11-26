@@ -233,6 +233,8 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_test) ||
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
+    outputs:
+      test-artifact-id: ${{ steps.upload-tests.outputs.artifact-id }}
     env:
       # Hosted runners must hold all workspace test executables at once. Keep
       # migration/dev and test DWARF out of this job, not release/local builds.
@@ -291,7 +293,7 @@ jobs:
 
       - name: Compile workspace test executables
         run: |
-          cargo test --workspace --all-features --no-run --timings \
+          cargo test --workspace --all-features --tests --no-run --timings \
             --message-format=json-render-diagnostics > "$RUNNER_TEMP/workspace-test-build.jsonl"
           python3 scripts/ci-rust-test-artifacts.py pack \
             < "$RUNNER_TEMP/workspace-test-build.jsonl" > "$RUNNER_TEMP/workspace-test-files.txt"
@@ -314,6 +316,7 @@ jobs:
             -T "$RUNNER_TEMP/workspace-test-files.txt"
 
       - name: Upload Rust test executables
+        id: upload-tests
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workspace-test-executables
@@ -393,7 +396,7 @@ jobs:
       - name: Download Rust test executables
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: workspace-test-executables
+          artifact-ids: ${{ needs.rust-test-build.outputs.test-artifact-id }}
           path: ${{ runner.temp }}
 
       - name: Extract Rust test executables

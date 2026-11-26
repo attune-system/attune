@@ -138,7 +138,7 @@ class CiRustResourceTests(unittest.TestCase):
         self.assertIn("rust-test-build", shard["needs"])
         self.assertEqual(shard["strategy"]["matrix"]["shard"], [1, 2])
         steps = {step["name"]: step for step in build["steps"] + shard["steps"]}
-        self.assertIn("cargo test --workspace --all-features --no-run --timings",
+        self.assertIn("cargo test --workspace --all-features --tests --no-run --timings",
                       steps["Compile workspace test executables"]["run"])
         self.assertEqual(steps["Workspace doctests"]["run"],
                          "cargo test --workspace --all-features --doc -- --test-threads=4")
@@ -146,6 +146,20 @@ class CiRustResourceTests(unittest.TestCase):
                       steps["Initialize test database"]["run"])
         self.assertEqual(steps["S3 storage correctness tests"]["if"], "matrix.shard == 1")
         self.assertEqual(steps["Completion broker integration tests"]["if"], "matrix.shard == 2")
+
+    def test_shard_reruns_use_the_original_build_artifact(self):
+        workflow, _manifest = inputs()
+        build = workflow["jobs"]["rust-test-build"]
+        shard = workflow["jobs"]["rust-test"]
+        upload = next(step for step in build["steps"] if step.get("id") == "upload-tests")
+        download = next(step for step in shard["steps"]
+                        if step.get("name") == "Download Rust test executables")
+        self.assertEqual(build["outputs"]["test-artifact-id"],
+                         "${{ steps.upload-tests.outputs.artifact-id }}")
+        self.assertEqual(upload["with"]["retention-days"], 7)
+        self.assertEqual(download["with"]["artifact-ids"],
+                         "${{ needs.rust-test-build.outputs.test-artifact-id }}")
+        self.assertNotIn("run-id", download["with"])
 
     def test_shards_separate_the_two_longest_suites(self):
         partition = runpy.run_path(str(ROOT / "scripts/ci-rust-test-artifacts.py"))["partition"]
