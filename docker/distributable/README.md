@@ -15,15 +15,15 @@ The compose file defaults to:
 
 - registry: `ghcr.io/attune-system`
 - platform tag: `latest`
-- independently selected core bootstrap image tag: `core-1.0.8`
+- independently selected core bootstrap image tag: `core-1.0.9`
 
 Override them with env vars:
 
 ```bash
 export ATTUNE_IMAGE_REGISTRY=ghcr.io/attune-system
 export ATTUNE_IMAGE_TAG=latest
-export ATTUNE_INIT_PACKS_IMAGE_TAG=core-1.0.8
-export ATTUNE_CORE_PACK_VERSION=1.0.8
+export ATTUNE_INIT_PACKS_IMAGE_TAG=core-1.0.9
+export ATTUNE_CORE_PACK_VERSION=1.0.9
 ```
 
 Select compatible coordinated platform and bootstrap images before deployment.

@@ -1,6 +1,6 @@
 # Attune core pack
 
-The core 1.0.8 source candidate ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
+The core 1.0.9 source candidate ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
 They are standalone static native binaries. No Python, shell, curl, or other
 interpreter/tool is required to execute them. Parameters remain a flat JSON
 object on stdin; the text actions keep text output and HTTP emits structured JSON.
@@ -81,6 +81,5 @@ See [testing](TESTING.md) and [deployment setup](SETUP.md).
 Core 1.0.8 deliberately restricts the formerly general HTTP client to public
 HTTP(S) destinations. Existing RFC1918, loopback and link-local automation calls
 are unsupported by the new action. Retained 1.0.7 releases and execution pins
-keep their original bytes and behavior. Version 1.0.8 is a source release target;
-no tag, archive, image, chart update or publication is implied by this change.
-Deploy only after coordinated release validation and publication.
+keep their original bytes and behavior. Deploy core 1.0.9 after its
+coordinated platform and bootstrap images are published.
