@@ -18,6 +18,9 @@ export DATABASE_URL="$database_url"
 export ATTUNE__DATABASE__URL="$database_url"
 
 cd "$ROOT"
+if [[ $# -ne 0 ]]; then
+  exec python3 scripts/ci-rust-test-artifacts.py run "$@" "$threads"
+fi
 if [[ -n "${ATTUNE_CI_BROKER_TEST_ARTIFACTS:-}" ]]; then
   # Record executables from this build so the broker tests need no Cargo rebuilds.
   cargo test --workspace --all-features --message-format=json-render-diagnostics -- --test-threads="$threads" |

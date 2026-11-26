@@ -51,6 +51,13 @@ RUNTIME_LOG_TEST_ENV = ATTUNE__DATABASE__URL=$(TEST_DB_URL) \
 	AWS_ACCESS_KEY_ID=$(RUNTIME_LOG_S3_ACCESS_KEY) \
 	AWS_SECRET_ACCESS_KEY=$(RUNTIME_LOG_S3_SECRET_KEY) AWS_REGION=us-east-1
 
+# CI can supply the exact libtest executables from its workspace build.
+RUNTIME_LOG_COMMON_TEST_FILTER = blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes
+RUNTIME_LOG_COMMON_TEST = $(if $(ATTUNE_S3_COMMON_TEST_BIN),\
+	env -C crates/common "$(ATTUNE_S3_COMMON_TEST_BIN)" $(RUNTIME_LOG_COMMON_TEST_FILTER),\
+	cargo test -p attune-common --lib $(RUNTIME_LOG_COMMON_TEST_FILTER) --)
+RUNTIME_LOG_REPLICA_TEST = $(if $(ATTUNE_S3_REPLICA_TEST_BIN),env -C crates/api "$(ATTUNE_S3_REPLICA_TEST_BIN)",cargo test -p attune-api --test runtime_log_replica_tests --)
+
 # Default target
 help:
 	@echo "Attune Development Commands"
@@ -215,11 +222,10 @@ runtime-log-test-storage-down:
 
 test-runtime-log-correctness:
 	@set -eu; trap '$(RUNTIME_LOG_S3_ENV) scripts/runtime-log-s3.sh clean-prefix' EXIT; \
-		$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-common --lib \
-			blob_store::tests::s3_direct_upload_authorization_puts_and_verifies_exact_bytes \
-			-- --ignored --exact --test-threads=$(DB_TEST_THREADS); \
-		$(RUNTIME_LOG_TEST_ENV) cargo test -p attune-api --test runtime_log_replica_tests \
-			-- --ignored --test-threads=$(DB_TEST_THREADS) \
+		$(RUNTIME_LOG_TEST_ENV) $(RUNTIME_LOG_COMMON_TEST) \
+			--ignored --exact --test-threads=$(DB_TEST_THREADS); \
+		$(RUNTIME_LOG_TEST_ENV) $(RUNTIME_LOG_REPLICA_TEST) \
+			--ignored --test-threads=$(DB_TEST_THREADS) \
 			--skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock
 
 test-runtime-log-load:

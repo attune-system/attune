@@ -114,6 +114,17 @@ class CiGateTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(changed_path_flags(path)["cargo_deny_inputs"], "false")
 
+    def test_rust_tests_run_for_shared_fixtures_outside_the_workspace(self):
+        for path in ("packaging/scripts/postinstall.sh",
+                     "web/src/test/fixtures/form-requests.json",
+                     "web/src/test/fixtures/permission-grant-options.json",
+                     "docs/examples/runtime-gradle.yaml",
+                     "docs/examples/runtime-native-image.yaml"):
+            with self.subTest(path=path):
+                needs = results(flags=changed_path_flags(path))
+                self.assertEqual(needs["rust-test"]["result"], "success")
+                self.assertEqual(evaluate(needs, "pull_request", {}), ([], []))
+
     def test_cargo_deny_failures_are_advisory_for_prs_without_input_changes(self):
         job = WORKFLOW["jobs"]["rust-audit"]
         policy = job["env"]["CARGO_DENY_ADVISORY"]

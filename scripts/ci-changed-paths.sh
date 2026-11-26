@@ -23,6 +23,8 @@ while IFS= read -r path; do
       cargo_deny_inputs=true ;;
   esac
   case "$path" in
+    packaging/scripts/postinstall.sh|web/src/test/fixtures/form-requests.json|web/src/test/fixtures/permission-grant-options.json|docs/examples/runtime-gradle.yaml|docs/examples/runtime-native-image.yaml)
+      rust=true ;;
     crates/*|migrations/*|*.rs|Cargo.toml|Cargo.lock|Makefile|.cargo/*|.github/workflows/ci.yml|scripts/*|docker/*|docker-compose*.yaml|docker-compose*.yml|config.*|packs/*|tests/fixtures/*)
       rust=true ;;
   esac

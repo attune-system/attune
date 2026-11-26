@@ -105,6 +105,30 @@ does not enable branch rules or add merge-queue support.
 The gate covers this workflow's jobs, not checks from separate workflows such as
 Windows CLI, CLI credentials, or pack-format golden vectors.
 
+### Measuring Rust CI performance
+
+`Build Rust tests` compiles the all-features workspace test targets and their
+companion binaries, uploads the Cargo timings
+report and an archive of executables, and runs doctests with Cargo. Two
+`Tests` shards then download that archive and run disjoint sets of whole test
+executables, each with its own database and broker. The runner assigns longer
+executables first using recorded wall times and prints new timings on each run.
+Shard 1 runs the explicit ignored S3 checks. Shard 2 runs the completion broker
+checks in owned RabbitMQ vhosts.
+`Native core tests` runs independently. Examples stay covered by all-targets
+Clippy and any dedicated example steps.
+
+To retry a shard, use **Re-run job** on that shard in GitHub Actions. The shard
+downloads the exact artifact ID published by the successful build in the
+original run. The archive is available for seven days. After it expires, rerun
+the whole workflow to rebuild the archive.
+
+Compare the compile, test, and native job durations for cold and warm runs of
+the same revision. The compiler-cache post step reports hits, misses, and cache
+errors. Set the repository Actions variable `CI_RUST_SCCACHE` to `false` for an
+uncached control with the same test selection and build layout. Compare the
+elapsed time to the gate as well as total runner time across the jobs.
+
 ### Common checks
 
 ```bash
