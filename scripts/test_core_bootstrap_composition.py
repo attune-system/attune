@@ -31,7 +31,7 @@ class CoreCompositionTests(unittest.TestCase):
             self.assertEqual(actual, expected)
             for relative in expected:
                 self.assertEqual((CORE / relative).stat().st_mode & 0o111, (owned / relative).stat().st_mode & 0o111, relative)
-            for folder, count in (("actions", 4), ("triggers", 7), ("sensors", 1), ("runtimes", 9), ("permission_sets", 5)):
+            for folder, count in (("actions", 4), ("triggers", 7), ("sensors", 1), ("runtimes", 14), ("permission_sets", 5)):
                 self.assertEqual(len(list((owned / folder).glob("*.yaml"))), count, folder)
 
     def test_core_actions_need_only_native_and_have_no_script_fallback(self):
@@ -70,7 +70,7 @@ class CoreCompositionTests(unittest.TestCase):
         self.assertEqual(yaml.safe_load((CORE / "permission_sets/key_creator.yaml").read_text())["ref"], "core.key_creator")
 
     def test_shipped_refs_and_canonical_installer_are_explicit(self):
-        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.8")
+        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.9")
         actions = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "actions").glob("*.yaml")}
         self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep", "core.http_request"})
         sensor = yaml.safe_load((CORE / "sensors/timer_sensor.yaml").read_text())
